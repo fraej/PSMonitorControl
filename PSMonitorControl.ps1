@@ -1,4 +1,4 @@
-﻿# PS Monitor Control — PowerShell + WPF GUI
+# PS Monitor Control — PowerShell + WPF GUI
 $SystemLanguage = (Get-UICulture).TwoLetterISOLanguageName
 
 $Messages = @{
@@ -282,8 +282,99 @@ if (-not ([System.Management.Automation.PSTypeName]'DpiAwareBoundsHelper').Type)
     }
 }
 
+# C# helper for EnumDisplayDevices (maps display paths to monitor hardware IDs)
+$displayDeviceCode = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public class DisplayDeviceHelper
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DISPLAY_DEVICE {
+        public uint cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string DeviceString;
+        public uint StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string DeviceKey;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool EnumDisplayDevices(string lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+
+    /// <summary>
+    /// Gets the monitor DeviceID for a given display adapter path (e.g. \\.\DISPLAY1).
+    /// The DeviceID contains the hardware ID (e.g. DISPLAY\LEN65FA\...) which can be
+    /// cross-referenced with WmiMonitorID to get the friendly name.
+    /// </summary>
+    public static string GetMonitorDeviceID(string adapterPath)
+    {
+        var d = new DISPLAY_DEVICE();
+        d.cb = (uint)Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        // EDD_GET_DEVICE_INTERFACE_NAME = 1
+        if (EnumDisplayDevices(adapterPath, 0, ref d, 1))
+        {
+            return d.DeviceID;
+        }
+        return null;
+    }
+}
+"@
+
+if (-not ([System.Management.Automation.PSTypeName]'DisplayDeviceHelper').Type) {
+    try {
+        Add-Type -TypeDefinition $displayDeviceCode -Language CSharp
+        Write-Host "Successfully loaded DisplayDeviceHelper class"
+    }
+    catch {
+        Write-Error "Failed to load DisplayDeviceHelper class: $_"
+        exit 1
+    }
+}
+
 # Load required assemblies
 Add-Type -AssemblyName PresentationFramework
+
+# Build a lookup table of monitor hardware IDs → friendly names from WMI
+$monitorFriendlyNames = @{}
+try {
+    $wmiMonitorIds = Get-CimInstance -Namespace root\WMI -ClassName WmiMonitorID -ErrorAction Stop
+    foreach ($wmiId in $wmiMonitorIds) {
+        $friendlyName = ($wmiId.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [char]$_ }) -join ''
+        # Extract hardware ID (e.g. "LEN65FA") from instance name like "DISPLAY\LEN65FA\..."
+        if ($wmiId.InstanceName -match 'DISPLAY\\([^\\]+)') {
+            $hwId = $Matches[1]
+            if ($friendlyName -and $friendlyName -ne "`0") {
+                $monitorFriendlyNames[$hwId] = $friendlyName
+            }
+        }
+    }
+    Write-Host "Loaded friendly names for $($monitorFriendlyNames.Count) monitors"
+}
+catch {
+    Write-Host "Could not load WMI monitor IDs for friendly names"
+}
+
+# Helper function: resolve display device path to friendly monitor name
+function Get-MonitorFriendlyName {
+    param([string]$DevicePath)
+    try {
+        $deviceId = [DisplayDeviceHelper]::GetMonitorDeviceID($DevicePath)
+        if ($deviceId -and $deviceId -match 'DISPLAY#([^#]+)') {
+            $hwId = $Matches[1]
+            if ($monitorFriendlyNames.ContainsKey($hwId)) {
+                return $monitorFriendlyNames[$hwId]
+            }
+        }
+    }
+    catch {}
+    return $null
+}
 
 # XAML UI definition
 $xamlContent = @"
@@ -414,6 +505,7 @@ foreach ($hMon in $hMonitors) {
     $bounds = [DpiAwareBoundsHelper]::GetMonitorBounds($hMon)
 
     $ddcMatched = $false
+    $physicalName = 'Generic PnP Monitor'
     try {
         $monitorCount = [uint32]0
         [MonitorControl]::GetNumberOfPhysicalMonitorsFromHMONITOR($hMon, [ref]$monitorCount)
@@ -423,6 +515,8 @@ foreach ($hMon in $hMonitors) {
 
             if ([MonitorControl]::GetPhysicalMonitorsFromHMONITOR($hMon, $monitorCount, $physicalMonitorArray)) {
                 foreach ($physMon in $physicalMonitorArray) {
+                    $physicalName = $physMon.szPhysicalMonitorDescription
+
                     # Test DDC/CI support by reading brightness (VCP 0x10)
                     $current = [uint32]0
                     $maximum = [uint32]0
@@ -430,14 +524,18 @@ foreach ($hMon in $hMonitors) {
                     if ([MonitorControl]::GetVCPFeatureAndVCPFeatureReply(
                             $physMon.hPhysicalMonitor, 0x10, [IntPtr]::Zero, [ref]$current, [ref]$maximum)) {
 
+                        # Use WMI friendly name if available, otherwise fall back to physical description
+                        $monName = Get-MonitorFriendlyName -DevicePath $deviceName
+                        if (-not $monName) { $monName = $physMon.szPhysicalMonitorDescription }
+
                         $monitors += @{
-                            Name           = $physMon.szPhysicalMonitorDescription
+                            Name           = $monName
                             Type           = 'DDC'
                             DisplayNumber  = $displayNumber
                             Bounds         = $bounds
                             PhysicalHandle = $physMon.hPhysicalMonitor
                         }
-                        Write-Host "Found DDC/CI capable monitor: Display $displayNumber - $($physMon.szPhysicalMonitorDescription)"
+                        Write-Host "Found DDC/CI capable monitor: Display $displayNumber - $monName"
                         $ddcMatched = $true
                     }
                     else {
@@ -452,14 +550,15 @@ foreach ($hMon in $hMonitors) {
         Write-Warning "Error detecting monitor: $_"
     }
 
-    # Track displays that didn't match DDC/CI (candidates for WMI)
+    # Track displays that didn't match DDC/CI (candidates for WMI or non-controllable fallback)
     if (-not $ddcMatched -and $displayNumber -gt 0) {
-        $unmatchedDisplays += @{ DisplayNumber = $displayNumber; Bounds = $bounds }
+        $unmatchedDisplays += @{ DisplayNumber = $displayNumber; Bounds = $bounds; PhysicalName = $physicalName; DevicePath = $deviceName }
     }
 }
 
 # Detect internal displays via WMI (laptop panels)
 Write-Host "Detecting WMI brightness-capable internal displays..."
+$wmiClaimedIndices = @()
 try {
     $wmiInstances = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop
     $wmiIndex = 0
@@ -471,6 +570,7 @@ try {
         if ($wmiIndex -lt $unmatchedDisplays.Count) {
             $wmiDisplayNumber = $unmatchedDisplays[$wmiIndex].DisplayNumber
             $wmiBounds = $unmatchedDisplays[$wmiIndex].Bounds
+            $wmiClaimedIndices += $wmiIndex
             $wmiIndex++
 
             $monitors += @{
@@ -490,6 +590,25 @@ try {
 }
 catch {
     Write-Host "No WMI brightness-capable internal displays found"
+}
+
+# Add remaining unmatched displays (e.g. TVs with no DDC/CI or WMI) as non-controllable entries
+for ($i = 0; $i -lt $unmatchedDisplays.Count; $i++) {
+    if ($wmiClaimedIndices -notcontains $i) {
+        $ud = $unmatchedDisplays[$i]
+        # Use WMI friendly name if available
+        $fallbackName = Get-MonitorFriendlyName -DevicePath $ud.DevicePath
+        if (-not $fallbackName) { $fallbackName = $ud.PhysicalName }
+
+        $monitors += @{
+            Name           = $fallbackName
+            Type           = 'None'
+            DisplayNumber  = $ud.DisplayNumber
+            Bounds         = $ud.Bounds
+            PhysicalHandle = $null
+        }
+        Write-Host "Found non-controllable display: Display $($ud.DisplayNumber) - $fallbackName"
+    }
 }
 
 # Sort monitors by Windows display number for natural ordering
@@ -523,7 +642,14 @@ function Update-MonitorValues {
 
     $script:isUpdating = $true
 
-    if ($selectedMonitor.Type -eq 'WMI') {
+    if ($selectedMonitor.Type -eq 'None') {
+        # --- Non-controllable display (no DDC/CI or WMI) ---
+        $brightnessSlider.IsEnabled = $false
+        $contrastSlider.IsEnabled = $false
+        $volumeSlider.IsEnabled = $false
+        $resetButton.IsEnabled = $false
+    }
+    elseif ($selectedMonitor.Type -eq 'WMI') {
         # --- WMI internal display: brightness only ---
         try {
             $wmiMon = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop |
