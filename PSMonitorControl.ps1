@@ -1,4 +1,4 @@
-# PS Monitor Control — PowerShell + WPF GUI
+﻿# PS Monitor Control — PowerShell + WPF GUI
 $SystemLanguage = (Get-UICulture).TwoLetterISOLanguageName
 
 $Messages = @{
@@ -465,23 +465,27 @@ try {
     $wmiIndex = 0
     foreach ($wmiMon in $wmiInstances) {
         $currentWmiBrightness = $wmiMon.CurrentBrightness
-        # Assign display number and bounds from a non-DDC display, if available
-        $wmiDisplayNumber = 0
-        $wmiBounds = @(0, 0, 1920, 1080)
+        # Only add WMI displays when they have a matching active display
+        # If the internal display is off (e.g. "second screen only" mode),
+        # EnumDisplayMonitors won't enumerate it, so no unmatched entry exists
         if ($wmiIndex -lt $unmatchedDisplays.Count) {
             $wmiDisplayNumber = $unmatchedDisplays[$wmiIndex].DisplayNumber
             $wmiBounds = $unmatchedDisplays[$wmiIndex].Bounds
             $wmiIndex++
+
+            $monitors += @{
+                Name           = Get-LocalizedString 'InternalDisplay'
+                Type           = 'WMI'
+                DisplayNumber  = $wmiDisplayNumber
+                Bounds         = $wmiBounds
+                InstanceName   = $wmiMon.InstanceName
+                PhysicalHandle = $null
+            }
+            Write-Host "Found WMI brightness-capable internal display: Display $wmiDisplayNumber (brightness: $currentWmiBrightness%)"
         }
-        $monitors += @{
-            Name           = Get-LocalizedString 'InternalDisplay'
-            Type           = 'WMI'
-            DisplayNumber  = $wmiDisplayNumber
-            Bounds         = $wmiBounds
-            InstanceName   = $wmiMon.InstanceName
-            PhysicalHandle = $null
+        else {
+            Write-Host "Skipping WMI display (internal panel not active): $($wmiMon.InstanceName)"
         }
-        Write-Host "Found WMI brightness-capable internal display: Display $wmiDisplayNumber (brightness: $currentWmiBrightness%)"
     }
 }
 catch {
